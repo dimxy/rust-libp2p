@@ -63,7 +63,7 @@ static NEXT_CONNECTION_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Connection identifier.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ConnectionId(usize);
+pub struct ConnectionId(pub usize);
 
 impl ConnectionId {
     /// Creates an _unchecked_ [`ConnectionId`].

@@ -96,6 +96,7 @@ pub struct Config {
     max_ihave_messages: usize,
     iwant_followup_time: Duration,
     published_message_ids_cache_time: Duration,
+    pub i_am_relay: bool,
 }
 
 impl Config {
@@ -441,6 +442,7 @@ impl Default for ConfigBuilder {
                 max_ihave_messages: 10,
                 iwant_followup_time: Duration::from_secs(3),
                 published_message_ids_cache_time: Duration::from_secs(10),
+                i_am_relay: false,
             },
             invalid_protocol: false,
         }

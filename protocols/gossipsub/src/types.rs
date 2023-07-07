@@ -19,7 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 //! A collection of types using the Gossipsub system.
-use crate::TopicHash;
+use crate::{rpc_proto::proto::IncludedToRelaysMesh, TopicHash};
 use libp2p_identity::PeerId;
 use libp2p_swarm::ConnectionId;
 use prometheus_client::encoding::EncodeLabelValue;
@@ -234,6 +234,13 @@ pub enum ControlAction {
         /// The backoff time in seconds before we allow to reconnect
         backoff: Option<u64>,
     },
+    IAmRelay(bool),
+    /// Whether the node included or excluded from other node relays mesh
+    IncludedToRelaysMesh {
+        included: bool,
+        mesh_size: usize,
+    },
+    MeshSize(usize),
 }
 
 /// An RPC received/sent.
@@ -290,6 +297,9 @@ impl From<Rpc> for proto::RPC {
             iwant: Vec::new(),
             graft: Vec::new(),
             prune: Vec::new(),
+            iamrelay: None,
+            included_to_relays_mesh: None,
+            mesh_size: None,
         };
 
         let empty_control_msg = rpc.control_msgs.is_empty();
@@ -337,6 +347,21 @@ impl From<Rpc> for proto::RPC {
                         backoff,
                     };
                     control.prune.push(rpc_prune);
+                }
+                ControlAction::IAmRelay(is_relay) => {
+                    control.iamrelay = Some(is_relay);
+                }
+                ControlAction::IncludedToRelaysMesh {
+                    included,
+                    mesh_size,
+                } => {
+                    control.included_to_relays_mesh = Some(IncludedToRelaysMesh {
+                        included,
+                        mesh_size: mesh_size as u32,
+                    });
+                }
+                ControlAction::MeshSize(size) => {
+                    control.mesh_size = Some(size as u32);
                 }
             }
         }

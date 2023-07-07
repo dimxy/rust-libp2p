@@ -336,6 +336,21 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// Keep track of a set of internal metrics relating to gossipsub.
     metrics: Option<Metrics>,
+
+    /// relays to which we forward the messages. Also tracks the relay mesh size of nodes in mesh.
+    relays_mesh: HashMap<PeerId, usize>,
+
+    /// Peers included our node to their relays mesh
+    included_to_relays_mesh: HashSet<PeerId>,
+
+    /// Relay mesh maintenance interval stream.
+    relay_mesh_maintenance_interval: Ticker,
+
+    /// The relay list which are forcefully kept in relay mesh
+    explicit_relay_list: Vec<PeerId>,
+
+    /// The peer ids of connected relay nodes
+    connected_relays: HashSet<PeerId>,
 }
 
 impl<D, F> Behaviour<D, F>
@@ -476,6 +491,14 @@ where
             config,
             subscription_filter,
             data_transform,
+            relays_mesh: HashMap::new(),
+            included_to_relays_mesh: HashSet::new(),
+            relay_mesh_maintenance_interval: Ticker::new_with_next(
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            ),
+            explicit_relay_list: Vec::new(),
+            connected_relays: HashSet::new(),
         })
     }
 }
@@ -2726,6 +2749,7 @@ where
                         && !originating_peers.contains(peer_id)
                         && Some(peer_id) != message.source.as_ref()
                         && topics.contains(&message.topic)
+                        && self.included_to_relays_mesh.contains(peer_id)
                     {
                         recipient_peers.insert(*peer_id);
                     }
@@ -2746,6 +2770,8 @@ where
                 }
             }
         }
+
+        // TODO
 
         // forward the message to peers
         if !recipient_peers.is_empty() {
@@ -3237,6 +3263,10 @@ where
             self.px_peers.remove(&peer_id);
             self.outbound_peers.remove(&peer_id);
 
+            self.relays_mesh.remove(&peer_id);
+            self.connected_relays.remove(&peer_id);
+            self.included_to_relays_mesh.remove(&peer_id);
+
             // Remove peer from peer_topics and connected_peers
             // NOTE: It is possible the peer has already been removed from all mappings if it does not
             // support the protocol.
@@ -3289,6 +3319,223 @@ where
                     endpoint_new
                 )
             }
+        }
+    }
+
+    /// The helper function to get a set of `n` random peers from the `relays` hashset
+    /// filtered by the function `f`.
+    fn get_random_relays(
+        relays: &HashSet<PeerId>,
+        n: usize,
+        mut f: impl FnMut(&PeerId) -> bool,
+    ) -> Vec<PeerId> {
+        let mut relays: Vec<_> = relays.iter().cloned().filter(|p| f(p)).collect();
+
+        // if we have less than needed, return them
+        if relays.len() <= n {
+            debug!("RANDOM RELAYS: Got {:?} peers", relays.len());
+            return relays;
+        }
+
+        // we have more peers than needed, shuffle them and return n of them
+        let mut rng = rand::thread_rng();
+        relays.partial_shuffle(&mut rng, n);
+        debug!("RANDOM RELAYS: Got {:?} peers", n);
+
+        relays[..n].to_vec()
+    }
+
+    fn maintain_relays_mesh(&mut self) {
+        if self.relays_mesh.len() < self.config.mesh_n_low() {
+            log::info!(
+                "HEARTBEAT: relays low. Contains: {:?} needs: {:?}",
+                self.relays_mesh.len(),
+                self.config.mesh_n_low(),
+            );
+            // add peers 1 by 1 to avoid overloading peaks when node connects to several other nodes at once
+            let required = 1;
+            // get `n` relays that are not in the `relays_mesh`
+            let to_add = Self::get_random_relays(&self.connected_relays, required, |p| {
+                !self.relays_mesh.contains_key(p)
+            });
+            self.add_peers_to_relays_mesh(to_add);
+        }
+
+        if self.relays_mesh.len() > self.config.mesh_n_high() {
+            log::info!(
+                "HEARTBEAT: relays high. Contains: {:?} needs: {:?}",
+                self.relays_mesh.len(),
+                self.config.mesh_n(),
+            );
+            self.clean_up_relays_mesh();
+        }
+
+        let size = self.relays_mesh.len();
+        for relay in self.relays_mesh.keys() {
+            Self::control_pool_add(
+                &mut self.control_pool,
+                *relay,
+                ControlAction::MeshSize(size),
+            );
+        }
+    }
+
+    #[allow(dead_code)]
+    fn remove_peer_from_relay_mesh(&mut self, peer: &PeerId) {
+        if self.relays_mesh.remove(peer).is_some() {
+            self.notify_excluded_from_relay_mesh(*peer)
+        }
+    }
+
+    /// Cleans up relays mesh so it remains mesh_n peers
+    fn clean_up_relays_mesh(&mut self) {
+        let mesh_n = self.config.mesh_n();
+        let mut removed = Vec::with_capacity(self.relays_mesh.len() - mesh_n);
+        let explicit_relay_list = self.explicit_relay_list.clone();
+        // perform 2 filter iterations to not keep excessive number of explicit peers in mesh
+        self.relays_mesh = self
+            .relays_mesh
+            .drain()
+            .enumerate()
+            .filter_map(|(i, peer)| {
+                if i < mesh_n || explicit_relay_list.contains(&peer.0) {
+                    Some(peer)
+                } else {
+                    removed.push(peer);
+                    None
+                }
+            })
+            .collect();
+
+        self.relays_mesh = self
+            .relays_mesh
+            .drain()
+            .enumerate()
+            .filter_map(|(i, peer)| {
+                if i < mesh_n {
+                    Some(peer)
+                } else {
+                    removed.push(peer);
+                    None
+                }
+            })
+            .collect();
+
+        for (peer, _) in removed {
+            self.notify_excluded_from_relay_mesh(peer)
+        }
+    }
+
+    fn notify_primary(&mut self, peer_id: PeerId, event: Rpc) {
+        if let Some(points) = self.connected_peers.get(&peer_id) {
+            if !points.connections.is_empty() {
+                let conn_id = points.connections[0].0;
+
+                return self.events.push_back(ToSwarm::NotifyHandler {
+                    peer_id,
+                    event: HandlerIn::Message(event.into_protobuf()),
+                    handler: NotifyHandler::One(ConnectionId(conn_id)),
+                });
+            }
+        }
+        warn!("Expected at least one connection of the peer '{}'", peer_id);
+
+        self.send_message(peer_id, event.clone().into_protobuf())
+            .expect("Message fragmentation should not fail");
+    }
+
+    fn notify_excluded_from_relay_mesh(&mut self, peer: PeerId) {
+        let event = Rpc {
+            subscriptions: Vec::new(),
+            messages: Vec::new(),
+            control_msgs: vec![ControlAction::IncludedToRelaysMesh {
+                included: false,
+                mesh_size: self.relays_mesh.len(),
+            }],
+        };
+        self.notify_primary(peer, event);
+    }
+
+    fn notify_included_to_relay_mesh(&mut self, peer: PeerId) {
+        let event = Rpc {
+            subscriptions: Vec::new(),
+            messages: Vec::new(),
+            control_msgs: vec![ControlAction::IncludedToRelaysMesh {
+                included: true,
+                mesh_size: self.relays_mesh.len(),
+            }],
+        };
+        self.notify_primary(peer, event);
+    }
+
+    /// Handles IAmrelay control message, does nothing if remote peer already subscribed to some topic
+    fn handle_i_am_relay(&mut self, peer_id: &PeerId, is_relay: bool) {
+        debug!("Handling IAmrelay message for peer: {:?}", peer_id);
+        if self
+            .peer_topics
+            .entry(*peer_id)
+            .or_insert_with(BTreeSet::new)
+            .is_empty()
+            && is_relay
+        {
+            log::info!("IAmrelay: Adding peer: {:?} to the relays list", peer_id);
+            self.connected_relays.insert(*peer_id);
+            if self.relays_mesh.len() < self.config.mesh_n_low() {
+                log::info!("IAmrelay: Adding peer: {:?} to the relay mesh", peer_id);
+                self.add_peers_to_relays_mesh(vec![*peer_id]);
+            }
+        }
+        debug!("Completed IAmrelay handling for peer: {:?}", peer_id);
+    }
+
+    /// Adds peers to relays mesh and notifies them they are added
+    fn add_peers_to_relays_mesh(&mut self, peers: Vec<PeerId>) {
+        for peer in &peers {
+            // other mesh size is unknown at this point
+            self.relays_mesh.insert(*peer, 0);
+        }
+        for peer in peers {
+            self.notify_included_to_relay_mesh(peer);
+        }
+    }
+
+    /// Handles IncludedTorelaysMesh message
+    fn handle_included_to_relays_mesh(
+        &mut self,
+        peer_id: &PeerId,
+        is_included: bool,
+        other_mesh_size: usize,
+    ) {
+        if self.config.i_am_relay {
+            debug!(
+                "Handling IncludedTorelaysMesh message for peer: {:?}, is_included: {}",
+                peer_id, is_included
+            );
+            if is_included {
+                if self.connected_relays.contains(peer_id) {
+                    if self.relays_mesh.len() > self.config.mesh_n_high() {
+                        self.notify_excluded_from_relay_mesh(*peer_id);
+                    } else {
+                        debug!("Adding peer {:?} to relays_mesh", peer_id);
+                        self.relays_mesh.insert(*peer_id, other_mesh_size);
+                    }
+                } else {
+                    debug!("Adding peer {:?} to included_to_relays_mesh", peer_id);
+                    self.included_to_relays_mesh.insert(*peer_id);
+                }
+            } else {
+                debug!(
+                    "Removing peer {:?} from included_to_relays_mesh and relays mesh",
+                    peer_id
+                );
+                self.included_to_relays_mesh.remove(peer_id);
+                self.relays_mesh.remove(peer_id);
+            }
+        } else {
+            debug!(
+                "Ignoring IncludedTorelaysMesh message for peer: {:?}, is_included: {}",
+                peer_id, is_included
+            );
         }
     }
 }
@@ -3446,6 +3693,22 @@ where
                             peers,
                             backoff,
                         } => prune_msgs.push((topic_hash, peers, backoff)),
+                        ControlAction::IAmRelay(is_relay) => {
+                            self.handle_i_am_relay(&propagation_source, is_relay)
+                        }
+                        ControlAction::IncludedToRelaysMesh {
+                            included,
+                            mesh_size,
+                        } => self.handle_included_to_relays_mesh(
+                            &propagation_source,
+                            included,
+                            mesh_size,
+                        ),
+                        ControlAction::MeshSize(size) => {
+                            if let Some(old_size) = self.relays_mesh.get_mut(&propagation_source) {
+                                *old_size = size;
+                            }
+                        }
                     }
                 }
                 if !ihave_msgs.is_empty() {
@@ -3479,6 +3742,10 @@ where
 
         while let Poll::Ready(Some(_)) = self.heartbeat.poll_next_unpin(cx) {
             self.heartbeat();
+        }
+
+        while let Poll::Ready(Some(_)) = self.relay_mesh_maintenance_interval.poll_next_unpin(cx) {
+            self.maintain_relays_mesh();
         }
 
         Poll::Pending

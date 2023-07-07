@@ -149,11 +149,50 @@ impl MessageWrite for Message {
 
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Default, PartialEq, Clone)]
+pub struct IncludedToRelaysMesh {
+    pub included: bool,
+    pub mesh_size: u32,
+}
+
+impl<'a> MessageRead<'a> for IncludedToRelaysMesh {
+    fn from_reader(r: &mut BytesReader, bytes: &'a [u8]) -> Result<Self> {
+        let mut msg = Self::default();
+        while !r.is_eof() {
+            match r.next_tag(bytes) {
+                Ok(8) => msg.included = r.read_bool(bytes)?,
+                Ok(16) => msg.mesh_size = r.read_uint32(bytes)?,
+                Ok(t) => { r.read_unknown(bytes, t)?; }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(msg)
+    }
+}
+
+impl MessageWrite for IncludedToRelaysMesh {
+    fn get_size(&self) -> usize {
+        0
+        + 1 + sizeof_varint(*(&self.included) as u64)
+        + 1 + sizeof_varint(*(&self.mesh_size) as u64)
+    }
+
+    fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
+        w.write_with_tag(8, |w| w.write_bool(*&self.included))?;
+        w.write_with_tag(16, |w| w.write_uint32(*&self.mesh_size))?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct ControlMessage {
     pub ihave: Vec<gossipsub::pb::ControlIHave>,
     pub iwant: Vec<gossipsub::pb::ControlIWant>,
     pub graft: Vec<gossipsub::pb::ControlGraft>,
     pub prune: Vec<gossipsub::pb::ControlPrune>,
+    pub iamrelay: Option<bool>,
+    pub included_to_relays_mesh: Option<gossipsub::pb::IncludedToRelaysMesh>,
+    pub mesh_size: Option<u32>,
 }
 
 impl<'a> MessageRead<'a> for ControlMessage {
@@ -165,6 +204,9 @@ impl<'a> MessageRead<'a> for ControlMessage {
                 Ok(18) => msg.iwant.push(r.read_message::<gossipsub::pb::ControlIWant>(bytes)?),
                 Ok(26) => msg.graft.push(r.read_message::<gossipsub::pb::ControlGraft>(bytes)?),
                 Ok(34) => msg.prune.push(r.read_message::<gossipsub::pb::ControlPrune>(bytes)?),
+                Ok(40) => msg.iamrelay = Some(r.read_bool(bytes)?),
+                Ok(50) => msg.included_to_relays_mesh = Some(r.read_message::<gossipsub::pb::IncludedToRelaysMesh>(bytes)?),
+                Ok(56) => msg.mesh_size = Some(r.read_uint32(bytes)?),
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -180,6 +222,9 @@ impl MessageWrite for ControlMessage {
         + self.iwant.iter().map(|s| 1 + sizeof_len((s).get_size())).sum::<usize>()
         + self.graft.iter().map(|s| 1 + sizeof_len((s).get_size())).sum::<usize>()
         + self.prune.iter().map(|s| 1 + sizeof_len((s).get_size())).sum::<usize>()
+        + self.iamrelay.as_ref().map_or(0, |m| 1 + sizeof_varint(*(m) as u64))
+        + self.included_to_relays_mesh.as_ref().map_or(0, |m| 1 + sizeof_len((m).get_size()))
+        + self.mesh_size.as_ref().map_or(0, |m| 1 + sizeof_varint(*(m) as u64))
     }
 
     fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
@@ -187,6 +232,9 @@ impl MessageWrite for ControlMessage {
         for s in &self.iwant { w.write_with_tag(18, |w| w.write_message(s))?; }
         for s in &self.graft { w.write_with_tag(26, |w| w.write_message(s))?; }
         for s in &self.prune { w.write_with_tag(34, |w| w.write_message(s))?; }
+        if let Some(ref s) = self.iamrelay { w.write_with_tag(40, |w| w.write_bool(*s))?; }
+        if let Some(ref s) = self.included_to_relays_mesh { w.write_with_tag(50, |w| w.write_message(s))?; }
+        if let Some(ref s) = self.mesh_size { w.write_with_tag(56, |w| w.write_uint32(*s))?; }
         Ok(())
     }
 }
