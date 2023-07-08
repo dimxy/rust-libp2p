@@ -21,7 +21,7 @@
 use std::{
     cmp::{max, Ordering},
     collections::HashSet,
-    collections::VecDeque,
+    collections::{hash_map::Entry, VecDeque},
     collections::{BTreeSet, HashMap},
     fmt,
     net::IpAddr,
@@ -36,7 +36,9 @@ use prometheus_client::registry::Registry;
 use rand::{seq::SliceRandom, thread_rng};
 
 use instant::Instant;
-use libp2p_core::{multiaddr::Protocol::Ip4, multiaddr::Protocol::Ip6, Endpoint, Multiaddr};
+use libp2p_core::{
+    multiaddr::Protocol::Ip4, multiaddr::Protocol::Ip6, ConnectedPoint, Endpoint, Multiaddr,
+};
 use libp2p_identity::Keypair;
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
@@ -352,6 +354,8 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// The peer ids of connected relay nodes
     connected_relays: HashSet<PeerId>,
+
+    peer_connections: HashMap<PeerId, Vec<(ConnectionId, ConnectedPoint)>>,
 }
 
 impl<D, F> Behaviour<D, F>
@@ -500,6 +504,7 @@ where
             ),
             explicit_relay_list: Vec::new(),
             connected_relays: HashSet::new(),
+            peer_connections: HashMap::new(),
         })
     }
 }
@@ -552,6 +557,12 @@ where
     /// subscribed.
     pub fn subscribe<H: Hasher>(&mut self, topic: &Topic<H>) -> Result<bool, SubscriptionError> {
         debug!("Subscribing to topic: {}", topic);
+
+        if self.config.i_am_relay {
+            debug!("Relay is subscribed to all topics by default. Subscribe has no effect.");
+            return Ok(false);
+        }
+
         let topic_hash = topic.hash();
         if !self.subscription_filter.can_subscribe(&topic_hash) {
             return Err(SubscriptionError::NotAllowed);
@@ -594,6 +605,12 @@ where
     /// Returns [`Ok(true)`] if we were subscribed to this topic.
     pub fn unsubscribe<H: Hasher>(&mut self, topic: &Topic<H>) -> Result<bool, PublishError> {
         debug!("Unsubscribing from topic: {}", topic);
+
+        if self.config.i_am_relay {
+            debug!("Relay is subscribed to all topics by default. Unsubscribe has no effect");
+            return Ok(false);
+        }
+
         let topic_hash = topic.hash();
 
         if self.mesh.get(&topic_hash).is_none() {
@@ -808,6 +825,42 @@ where
         }
 
         Ok(msg_id)
+    }
+
+    /// This function should be called when [`Config::validate_messages()`] is `true` in order to
+    /// propagate messages. Messages are stored in the ['Memcache'] and validation is expected to be
+    /// fast enough that the messages should still exist in the cache.
+    ///
+    /// Calling this function will propagate a message stored in the cache, if it still exists.
+    /// If the message still exists in the cache, it will be forwarded and this function will return true,
+    /// otherwise it will return false.
+    pub fn propagate_message(
+        &mut self,
+        message_id: &MessageId,
+        propagation_source: &PeerId,
+    ) -> Result<bool, PublishError> {
+        let (raw_message, originating_peers) = match self.mcache.validate(message_id) {
+            Some((raw_message, originating_peers)) => (raw_message.clone(), originating_peers),
+            None => {
+                warn!(
+                    "Message not in cache. Ignoring forwarding. Message Id: {}",
+                    message_id
+                );
+                if let Some(metrics) = self.metrics.as_mut() {
+                    metrics.memcache_miss();
+                }
+                return Ok(false);
+            }
+        };
+
+        self.forward_msg(
+            message_id,
+            raw_message,
+            Some(propagation_source),
+            originating_peers,
+        )?;
+
+        Ok(true)
     }
 
     /// This function should be called when [`Config::validate_messages()`] is `true` after
@@ -3157,6 +3210,11 @@ where
             }
         }
 
+        self.peer_connections
+            .entry(peer_id)
+            .or_insert_with(Default::default)
+            .push((connection_id, endpoint.clone()));
+
         // By default we assume a peer is only a floodsub peer.
         //
         // The protocol negotiation occurs once a message is sent/received. Once this happens we
@@ -3177,30 +3235,32 @@ where
                 debug!("Ignoring connection from blacklisted peer: {}", peer_id);
             } else {
                 debug!("New peer connected: {}", peer_id);
-                // We need to send our subscriptions to the newly-connected node.
-                let mut subscriptions = vec![];
-                for topic_hash in self.mesh.keys() {
-                    subscriptions.push(Subscription {
-                        topic_hash: topic_hash.clone(),
-                        action: SubscriptionAction::Subscribe,
-                    });
-                }
 
-                if !subscriptions.is_empty() {
-                    // send our subscriptions to the peer
-                    if self
-                        .send_message(
-                            peer_id,
-                            Rpc {
-                                messages: Vec::new(),
-                                subscriptions,
-                                control_msgs: Vec::new(),
-                            }
-                            .into_protobuf(),
-                        )
-                        .is_err()
-                    {
-                        error!("Failed to send subscriptions, message too large");
+                if self.config.i_am_relay {
+                    debug!("Sending IAmRelay to peer {:?}", peer_id);
+                    let event = Rpc {
+                        messages: Vec::new(),
+                        subscriptions: Vec::new(),
+                        control_msgs: vec![ControlAction::IAmRelay(true)],
+                    };
+                    self.notify_primary(peer_id, event);
+                } else {
+                    // We need to send our subscriptions to the newly-connected node.
+                    let mut subscriptions = vec![];
+                    for topic_hash in self.mesh.keys() {
+                        subscriptions.push(Subscription {
+                            topic_hash: topic_hash.clone(),
+                            action: SubscriptionAction::Subscribe,
+                        });
+                    }
+
+                    if !subscriptions.is_empty() {
+                        let event = Rpc {
+                            messages: Vec::new(),
+                            subscriptions,
+                            control_msgs: Vec::new(),
+                        };
+                        self.notify_primary(peer_id, event);
                     }
                 }
             }
@@ -3234,6 +3294,14 @@ where
                     peer_id,
                     endpoint
                 )
+            }
+        }
+
+        if let Entry::Occupied(mut o) = self.peer_connections.entry(peer_id) {
+            let connected_points = o.get_mut();
+            connected_points.retain(|(conn_id, _point)| conn_id != &connection_id);
+            if connected_points.is_empty() {
+                o.remove_entry();
             }
         }
 
@@ -3327,6 +3395,7 @@ where
             self.relays_mesh.remove(&peer_id);
             self.connected_relays.remove(&peer_id);
             self.included_to_relays_mesh.remove(&peer_id);
+            self.peer_connections.remove(&peer_id);
 
             // Remove peer from peer_topics and connected_peers
             // NOTE: It is possible the peer has already been removed from all mappings if it does not
@@ -3488,17 +3557,18 @@ where
     }
 
     fn notify_primary(&mut self, peer_id: PeerId, event: Rpc) {
-        if let Some(points) = self.connected_peers.get(&peer_id) {
-            if !points.connections.is_empty() {
-                let conn_id = points.connections[0].0;
+        if let Some(points) = self.peer_connections.get(&peer_id) {
+            if !points.is_empty() {
+                let conn_id = points[0].0;
 
                 return self.events.push_back(ToSwarm::NotifyHandler {
                     peer_id,
                     event: HandlerIn::Message(event.into_protobuf()),
-                    handler: NotifyHandler::One(ConnectionId(conn_id)),
+                    handler: NotifyHandler::One(conn_id),
                 });
             }
         }
+
         warn!("Expected at least one connection of the peer '{}'", peer_id);
 
         self.send_message(peer_id, event.clone().into_protobuf())
@@ -3598,6 +3668,43 @@ where
                 peer_id, is_included
             );
         }
+    }
+
+    pub fn get_relay_mesh(&self) -> Vec<PeerId> {
+        self.relays_mesh.keys().cloned().collect()
+    }
+
+    pub fn get_peers_connections(&self) -> HashMap<PeerId, Vec<(ConnectionId, ConnectedPoint)>> {
+        self.peer_connections.clone()
+    }
+
+    pub fn get_mesh(&self) -> &HashMap<TopicHash, BTreeSet<PeerId>> {
+        &self.mesh
+    }
+
+    pub fn get_all_topic_peers(&self) -> &HashMap<TopicHash, BTreeSet<PeerId>> {
+        &self.topic_peers
+    }
+
+    pub fn get_all_peer_topics(&self) -> &HashMap<PeerId, BTreeSet<TopicHash>> {
+        &self.peer_topics
+    }
+
+    pub fn get_num_peers(&self) -> usize {
+        self.peer_topics.len()
+    }
+
+    pub fn relay_mesh_len(&self) -> usize {
+        self.relays_mesh.len()
+    }
+
+    pub fn connected_relays_len(&self) -> usize {
+        self.connected_relays.len()
+    }
+
+    /// Get count of received messages in the [`GossipsubConfig::duplicate_cache_time`] period.
+    pub fn get_received_messages_in_period(&self) -> (Duration, usize) {
+        (self.duplicate_cache.ttl(), self.duplicate_cache.len())
     }
 }
 

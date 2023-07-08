@@ -191,6 +191,14 @@ where
     pub(crate) fn entry(&mut self, key: Key) -> Entry<'_, Key, Value> {
         self.0.entry(key)
     }
+
+    pub(crate) fn ttl(&self) -> instant::Duration {
+        self.0.ttl
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.map.len()
+    }
 }
 
 #[cfg(test)]
