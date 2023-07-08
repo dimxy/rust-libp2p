@@ -652,7 +652,7 @@ where
         topic: impl Into<TopicHash>,
         data: impl Into<Vec<u8>>,
     ) -> Result<MessageId, PublishError> {
-        self.publish_many_from(
+        self.publish_from(
             topic,
             data,
             *(self
@@ -663,7 +663,7 @@ where
     }
 
     /// Publishes a message with multiple topics to the network.
-    pub fn publish_many_from(
+    pub fn publish_from(
         &mut self,
         topic: impl Into<TopicHash>,
         data: impl Into<Vec<u8>>,

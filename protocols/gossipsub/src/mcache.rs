@@ -107,6 +107,7 @@ impl MessageCache {
     }
 
     /// Get a message with `message_id`
+    #[cfg(test)]
     pub(crate) fn get(&self, message_id: &MessageId) -> Option<&RawMessage> {
         self.msgs.get(message_id).map(|(message, _)| message)
     }
