@@ -45,6 +45,7 @@ use libp2p_swarm::{
     ConnectionDenied, ConnectionId, NetworkBehaviour, NotifyHandler, PollParameters, THandler,
     THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
+use smallvec::SmallVec;
 
 use crate::backoff::BackoffStorage;
 use crate::config::{Config, ValidationMode};
@@ -253,7 +254,7 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// An LRU Time cache for storing seen messages (based on their ID). This cache prevents
     /// duplicates from being propagated to the application and on the network.
-    duplicate_cache: DuplicateCache<MessageId>,
+    duplicate_cache: DuplicateCache<MessageId, SmallVec<[PeerId; 12]>>,
 
     /// A set of connected peers, indexed by their [`PeerId`] tracking both the [`PeerKind`] and
     /// the set of [`ConnectionId`]s.
@@ -321,7 +322,7 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// Short term cache for published message ids. This is used for penalizing peers sending
     /// our own messages back if the messages are anonymous or use a random author.
-    published_message_ids: DuplicateCache<MessageId>,
+    published_message_ids: DuplicateCache<MessageId, ()>,
 
     /// Short term cache for fast message ids mapping them to the real message ids
     fast_message_id_cache: TimeCache<FastMessageId, MessageId>,
@@ -634,6 +635,23 @@ where
         topic: impl Into<TopicHash>,
         data: impl Into<Vec<u8>>,
     ) -> Result<MessageId, PublishError> {
+        self.publish_many_from(
+            topic,
+            data,
+            *(self
+                .publish_config
+                .get_own_id()
+                .expect("own id can not be empty")),
+        )
+    }
+
+    /// Publishes a message with multiple topics to the network.
+    pub fn publish_many_from(
+        &mut self,
+        topic: impl Into<TopicHash>,
+        data: impl Into<Vec<u8>>,
+        source: PeerId,
+    ) -> Result<MessageId, PublishError> {
         let data = data.into();
         let topic = topic.into();
 
@@ -642,7 +660,8 @@ where
             .data_transform
             .outbound_transform(&topic, data.clone())?;
 
-        let raw_message = self.build_raw_message(topic, transformed_data)?;
+        let mut raw_message = self.build_raw_message(topic, transformed_data)?;
+        raw_message.source = Some(source);
 
         // calculate the message id from the un-transformed data
         let msg_id = self.config.message_id(&Message {
@@ -759,14 +778,15 @@ where
 
         // If the message isn't a duplicate and we have sent it to some peers add it to the
         // duplicate cache and memcache.
-        self.duplicate_cache.insert(msg_id.clone());
+        self.duplicate_cache
+            .insert(msg_id.clone(), SmallVec::from_elem(source, 1));
         self.mcache.put(&msg_id, raw_message);
 
         // If the message is anonymous or has a random author add it to the published message ids
         // cache.
         if let PublishConfig::RandomAuthor | PublishConfig::Anonymous = self.publish_config {
             if !self.config.allow_self_origin() {
-                self.published_message_ids.insert(msg_id.clone());
+                self.published_message_ids.insert(msg_id.clone(), ());
             }
         }
 
@@ -1834,14 +1854,21 @@ where
                 .or_insert_with(|| msg_id.clone());
         }
 
-        if !self.duplicate_cache.insert(msg_id.clone()) {
-            debug!("Message already received, ignoring. Message: {}", msg_id);
-            if let Some((peer_score, ..)) = &mut self.peer_score {
-                peer_score.duplicated_message(propagation_source, &msg_id, &message.topic);
+        match self.duplicate_cache.entry(msg_id.clone()) {
+            crate::time_cache::Entry::Occupied(entry) => {
+                debug!("Message already received, ignoring. Message: {}", msg_id);
+                entry.into_mut().push(*propagation_source);
+                if let Some((peer_score, ..)) = &mut self.peer_score {
+                    peer_score.duplicated_message(propagation_source, &msg_id, &message.topic);
+                }
+                self.mcache.observe_duplicate(&msg_id, propagation_source);
+                return;
             }
-            self.mcache.observe_duplicate(&msg_id, propagation_source);
-            return;
+            crate::time_cache::Entry::Vacant(entry) => {
+                entry.insert(SmallVec::from_elem(*propagation_source, 1));
+            }
         }
+
         debug!(
             "Put message {:?} in duplicate_cache and resolve promises",
             msg_id
@@ -2771,7 +2798,7 @@ where
             }
         }
 
-        // TODO
+        let mut r = false;
 
         // forward the message to peers
         if !recipient_peers.is_empty() {
@@ -2784,17 +2811,51 @@ where
 
             let msg_bytes = event.get_size();
             for peer in recipient_peers.iter() {
+                if let Some(received_from_peers) = self.duplicate_cache.get(&msg_id) {
+                    if received_from_peers.contains(peer) {
+                        continue;
+                    }
+                }
+
                 debug!("Sending message: {:?} to peer {:?}", msg_id, peer);
                 self.send_message(*peer, event.clone())?;
                 if let Some(m) = self.metrics.as_mut() {
                     m.msg_sent(&message.topic, msg_bytes);
                 }
             }
-            debug!("Completed forwarding message");
-            Ok(true)
-        } else {
-            Ok(false)
+
+            r = true;
         }
+
+        if !self.relays_mesh.is_empty() {
+            debug!("Forwarding message to relays: {:?}", msg_id);
+            let message_source = message.source;
+            let event = Rpc {
+                subscriptions: Vec::new(),
+                messages: vec![message],
+                control_msgs: Vec::new(),
+            };
+
+            let relays: Vec<_> = self.relays_mesh.keys().copied().collect();
+            for relay in relays {
+                if let Some(received_from_peers) = self.duplicate_cache.get(&msg_id) {
+                    if received_from_peers.contains(&relay) {
+                        continue;
+                    }
+                }
+
+                if Some(&relay) != propagation_source && Some(relay) != message_source {
+                    debug!("Sending message: {:?} to relay {:?}", msg_id, relay);
+                    self.notify_primary(relay, event.clone());
+                }
+            }
+            r = true;
+
+            debug!("Completed forwarding message to relays");
+        }
+
+        debug!("Completed forwarding message");
+        Ok(r)
     }
 
     /// Constructs a [`RawMessage`] performing message signing if required.

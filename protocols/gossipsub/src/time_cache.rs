@@ -156,11 +156,12 @@ where
     }
 }
 
-pub(crate) struct DuplicateCache<Key>(TimeCache<Key, ()>);
+pub(crate) struct DuplicateCache<Key, Value>(TimeCache<Key, Value>);
 
-impl<Key> DuplicateCache<Key>
+impl<Key, Value> DuplicateCache<Key, Value>
 where
     Key: Eq + std::hash::Hash + Clone,
+    Value: Clone,
 {
     pub(crate) fn new(ttl: Duration) -> Self {
         Self(TimeCache::new(ttl))
@@ -170,9 +171,9 @@ where
     //
     // If the key was not present this returns `true`. If the value was already present this
     // returns `false`.
-    pub(crate) fn insert(&mut self, key: Key) -> bool {
+    pub(crate) fn insert(&mut self, key: Key, value: Value) -> bool {
         if let Entry::Vacant(entry) = self.0.entry(key) {
-            entry.insert(());
+            entry.insert(value);
             true
         } else {
             false
@@ -181,6 +182,14 @@ where
 
     pub(crate) fn contains(&self, key: &Key) -> bool {
         self.0.contains_key(key)
+    }
+
+    pub(crate) fn get(&self, key: &Key) -> Option<Value> {
+        self.0.get(key).cloned()
+    }
+
+    pub(crate) fn entry(&mut self, key: Key) -> Entry<'_, Key, Value> {
+        self.0.entry(key)
     }
 }
 
@@ -192,29 +201,29 @@ mod test {
     fn cache_added_entries_exist() {
         let mut cache = DuplicateCache::new(Duration::from_secs(10));
 
-        cache.insert("t");
-        cache.insert("e");
+        cache.insert("t", ());
+        cache.insert("e", ());
 
         // Should report that 't' and 't' already exists
-        assert!(!cache.insert("t"));
-        assert!(!cache.insert("e"));
+        assert!(!cache.insert("t", ()));
+        assert!(!cache.insert("e", ()));
     }
 
     #[test]
     fn cache_entries_expire() {
         let mut cache = DuplicateCache::new(Duration::from_millis(100));
 
-        cache.insert("t");
-        assert!(!cache.insert("t"));
-        cache.insert("e");
-        //assert!(!cache.insert("t"));
-        assert!(!cache.insert("e"));
+        cache.insert("t", ());
+        assert!(!cache.insert("t", ()));
+        cache.insert("e", ());
+        //assert!(!cache.insert("t", ()));
+        assert!(!cache.insert("e", ()));
         // sleep until cache expiry
         std::thread::sleep(Duration::from_millis(101));
         // add another element to clear previous cache
-        cache.insert("s");
+        cache.insert("s", ());
 
         // should be removed from the cache
-        assert!(cache.insert("t"));
+        assert!(cache.insert("t", ()));
     }
 }
