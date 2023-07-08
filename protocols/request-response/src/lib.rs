@@ -351,6 +351,17 @@ where
     {
         Self::with_codec(TCodec::default(), protocols, cfg)
     }
+
+    pub fn addresses_of_peer(&mut self, peer: &PeerId) -> Vec<Multiaddr> {
+        let mut addresses = Vec::new();
+        if let Some(connections) = self.connected.get(peer) {
+            addresses.extend(connections.iter().filter_map(|c| c.address.clone()))
+        }
+        if let Some(more) = self.addresses.get(peer) {
+            addresses.extend(more.into_iter().cloned());
+        }
+        addresses
+    }
 }
 
 impl<TCodec> Behaviour<TCodec>
