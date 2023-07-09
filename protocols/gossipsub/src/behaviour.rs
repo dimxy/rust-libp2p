@@ -356,6 +356,8 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     connected_relays: HashSet<PeerId>,
 
     peer_connections: HashMap<PeerId, Vec<(ConnectionId, ConnectedPoint)>>,
+
+    connected_addresses: Vec<Multiaddr>,
 }
 
 impl<D, F> Behaviour<D, F>
@@ -505,6 +507,7 @@ where
             explicit_relay_list: Vec::new(),
             connected_relays: HashSet::new(),
             peer_connections: HashMap::new(),
+            connected_addresses: Vec::new(),
         })
     }
 }
@@ -3210,6 +3213,9 @@ where
             }
         }
 
+        self.connected_addresses
+            .push(endpoint.get_remote_address().clone());
+
         self.peer_connections
             .entry(peer_id)
             .or_insert_with(Default::default)
@@ -3296,6 +3302,9 @@ where
                 )
             }
         }
+
+        self.connected_addresses
+            .retain(|addr| addr != endpoint.get_remote_address());
 
         if let Entry::Occupied(mut o) = self.peer_connections.entry(peer_id) {
             let connected_points = o.get_mut();
@@ -3705,6 +3714,27 @@ where
     /// Get count of received messages in the [`GossipsubConfig::duplicate_cache_time`] period.
     pub fn get_received_messages_in_period(&self) -> (Duration, usize) {
         (self.duplicate_cache.ttl(), self.duplicate_cache.len())
+    }
+
+    pub fn add_explicit_relay(&mut self, peer_id: PeerId) {
+        log::info!("Adding peer {} to explicit relay list", peer_id);
+        self.explicit_relay_list.push(peer_id);
+    }
+
+    pub fn is_relay(&self) -> bool {
+        self.config.i_am_relay
+    }
+
+    pub fn get_config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn connected_relays(&self) -> Vec<PeerId> {
+        self.connected_relays.iter().cloned().collect()
+    }
+
+    pub fn is_connected_to_addr(&self, addr: &Multiaddr) -> bool {
+        self.connected_addresses.contains(addr)
     }
 }
 

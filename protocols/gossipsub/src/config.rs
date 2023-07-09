@@ -871,6 +871,11 @@ impl ConfigBuilder {
 
         Ok(self.config.clone())
     }
+
+    pub fn i_am_relay(&mut self, i_am_relay: bool) -> &mut Self {
+        self.config.i_am_relay = i_am_relay;
+        self
+    }
 }
 
 impl std::fmt::Debug for Config {
