@@ -75,6 +75,7 @@ pub mod json;
 
 pub use codec::Codec;
 pub use handler::ProtocolSupport;
+pub use handler::Event as HandlerEvent;
 
 use crate::handler::protocol::RequestProtocol;
 use futures::channel::oneshot;
@@ -248,7 +249,7 @@ impl std::error::Error for InboundFailure {}
 /// See [`Behaviour::send_response`].
 #[derive(Debug)]
 pub struct ResponseChannel<TResponse> {
-    sender: oneshot::Sender<TResponse>,
+    pub sender: oneshot::Sender<TResponse>,
 }
 
 impl<TResponse> ResponseChannel<TResponse> {
