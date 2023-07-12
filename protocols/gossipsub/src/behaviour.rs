@@ -561,10 +561,10 @@ where
     pub fn subscribe<H: Hasher>(&mut self, topic: &Topic<H>) -> Result<bool, SubscriptionError> {
         debug!("Subscribing to topic: {}", topic);
 
-        if self.config.i_am_relay {
-            debug!("Relay is subscribed to all topics by default. Subscribe has no effect.");
-            return Ok(false);
-        }
+        // if self.config.i_am_relay {
+        //     debug!("Relay is subscribed to all topics by default. Subscribe has no effect.");
+        //     return Ok(false);
+        // }
 
         let topic_hash = topic.hash();
         if !self.subscription_filter.can_subscribe(&topic_hash) {
