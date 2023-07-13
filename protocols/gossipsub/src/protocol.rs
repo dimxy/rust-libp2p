@@ -481,10 +481,31 @@ impl Decoder for GossipsubCodec {
                 });
             }
 
+            let mut i_am_relay_msgs = Vec::new();
+            if let Some(i_am_relay) = rpc_control.iamrelay {
+                i_am_relay_msgs.push(ControlAction::IAmRelay(i_am_relay));
+            }
+
+            let mut included_to_relays_mesh_msgs = Vec::new();
+            if let Some(included_to_relays_mesh) = rpc_control.included_to_relays_mesh {
+                included_to_relays_mesh_msgs.push(ControlAction::IncludedToRelaysMesh {
+                    included: included_to_relays_mesh.included,
+                    mesh_size: included_to_relays_mesh.mesh_size as usize,
+                });
+            }
+
+            let mut mesh_size_msgs = Vec::new();
+            if let Some(mesh_size) = rpc_control.mesh_size {
+                mesh_size_msgs.push(ControlAction::MeshSize(mesh_size as usize));
+            }
+
             control_msgs.extend(ihave_msgs);
             control_msgs.extend(iwant_msgs);
             control_msgs.extend(graft_msgs);
             control_msgs.extend(prune_msgs);
+            control_msgs.extend(i_am_relay_msgs);
+            control_msgs.extend(included_to_relays_mesh_msgs);
+            control_msgs.extend(mesh_size_msgs);
         }
 
         Ok(Some(HandlerEvent::Message {

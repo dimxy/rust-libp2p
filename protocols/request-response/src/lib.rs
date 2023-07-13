@@ -74,8 +74,8 @@ mod handler;
 pub mod json;
 
 pub use codec::Codec;
-pub use handler::ProtocolSupport;
 pub use handler::Event as HandlerEvent;
+pub use handler::ProtocolSupport;
 
 use crate::handler::protocol::RequestProtocol;
 use futures::channel::oneshot;
