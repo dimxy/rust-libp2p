@@ -561,10 +561,10 @@ where
     pub fn subscribe<H: Hasher>(&mut self, topic: &Topic<H>) -> Result<bool, SubscriptionError> {
         debug!("Subscribing to topic: {}", topic);
 
-        // if self.config.i_am_relay {
-        //     debug!("Relay is subscribed to all topics by default. Subscribe has no effect.");
-        //     return Ok(false);
-        // }
+        if self.config.i_am_relay {
+            debug!("Relay is subscribed to all topics by default. Subscribe has no effect.");
+            return Ok(false);
+        }
 
         let topic_hash = topic.hash();
         if !self.subscription_filter.can_subscribe(&topic_hash) {
@@ -695,105 +695,44 @@ where
             subscriptions: Vec::new(),
             messages: vec![raw_message.clone()],
             control_msgs: Vec::new(),
-        }
-        .into_protobuf();
-
-        // check that the size doesn't exceed the max transmission size
-        if event.get_size() > self.config.max_transmit_size() {
-            return Err(PublishError::MessageTooLarge);
-        }
-
-        // Check the if the message has been published before
-        if self.duplicate_cache.contains(&msg_id) {
-            // This message has already been seen. We don't re-publish messages that have already
-            // been published on the network.
-            warn!(
-                "Not publishing a message that has already been published. Msg-id {}",
-                msg_id
-            );
-            return Err(PublishError::Duplicate);
-        }
+        };
 
         trace!("Publishing message: {:?}", msg_id);
 
         let topic_hash = raw_message.topic.clone();
 
-        // If we are not flood publishing forward the message to mesh peers.
-        let mesh_peers_sent = !self.config.flood_publish()
-            && self.forward_msg(&msg_id, raw_message.clone(), None, HashSet::new())?;
+        self.forward_msg(&msg_id, raw_message.clone(), Some(&source), HashSet::new())?;
 
         let mut recipient_peers = HashSet::new();
-        if let Some(set) = self.topic_peers.get(&topic_hash) {
-            if self.config.flood_publish() {
-                // Forward to all peers above score and all explicit peers
-                recipient_peers.extend(
-                    set.iter()
-                        .filter(|p| {
-                            self.explicit_peers.contains(*p)
-                                || !self.score_below_threshold(p, |ts| ts.publish_threshold).0
-                        })
-                        .cloned(),
-                );
+        // if not subscribed to the topic, use fanout peers
+        if self.mesh.get(&topic_hash).is_none() {
+            debug!("Topic: {:?} not in the mesh", topic_hash);
+            // build a list of peers to forward the message to
+            // if we have fanout peers add them to the map
+            if self.fanout.contains_key(&topic_hash) {
+                for peer in self.fanout.get(&topic_hash).expect("Topic must exist") {
+                    recipient_peers.insert(*peer);
+                }
             } else {
-                // Explicit peers
-                for peer in &self.explicit_peers {
-                    if set.contains(peer) {
-                        recipient_peers.insert(*peer);
-                    }
-                }
-
-                // Floodsub peers
-                for (peer, connections) in &self.connected_peers {
-                    if connections.kind == PeerKind::Floodsub
-                        && !self
-                            .score_below_threshold(peer, |ts| ts.publish_threshold)
-                            .0
-                    {
-                        recipient_peers.insert(*peer);
-                    }
-                }
-
-                // Gossipsub peers
-                if self.mesh.get(&topic_hash).is_none() {
-                    debug!("Topic: {:?} not in the mesh", topic_hash);
-                    // If we have fanout peers add them to the map.
-                    if self.fanout.contains_key(&topic_hash) {
-                        for peer in self.fanout.get(&topic_hash).expect("Topic must exist") {
-                            recipient_peers.insert(*peer);
-                        }
-                    } else {
-                        // We have no fanout peers, select mesh_n of them and add them to the fanout
-                        let mesh_n = self.config.mesh_n();
-                        let new_peers = get_random_peers(
-                            &self.topic_peers,
-                            &self.connected_peers,
-                            &topic_hash,
-                            mesh_n,
-                            {
-                                |p| {
-                                    !self.explicit_peers.contains(p)
-                                        && !self
-                                            .score_below_threshold(p, |pst| pst.publish_threshold)
-                                            .0
-                                }
-                            },
-                        );
-                        // Add the new peers to the fanout and recipient peers
-                        self.fanout.insert(topic_hash.clone(), new_peers.clone());
-                        for peer in new_peers {
-                            debug!("Peer added to fanout: {:?}", peer);
-                            recipient_peers.insert(peer);
-                        }
-                    }
-                    // We are publishing to fanout peers - update the time we published
-                    self.fanout_last_pub
-                        .insert(topic_hash.clone(), Instant::now());
+                // we have no fanout peers, select mesh_n of them and add them to the fanout
+                let mesh_n = self.config.mesh_n();
+                let new_peers = get_random_peers(
+                    &self.topic_peers,
+                    &self.connected_peers,
+                    &topic_hash,
+                    mesh_n,
+                    |_| true,
+                );
+                // add the new peers to the fanout and recipient peers
+                self.fanout.insert(topic_hash.clone(), new_peers.clone());
+                for peer in new_peers {
+                    debug!("Peer added to fanout: {:?}", peer);
+                    recipient_peers.insert(peer);
                 }
             }
-        }
-
-        if recipient_peers.is_empty() && !mesh_peers_sent {
-            return Err(PublishError::InsufficientPeers);
+            // we are publishing to fanout peers - update the time we published
+            self.fanout_last_pub
+                .insert(topic_hash.clone(), Instant::now());
         }
 
         // If the message isn't a duplicate and we have sent it to some peers add it to the
@@ -802,29 +741,12 @@ where
             .insert(msg_id.clone(), SmallVec::from_elem(source, 1));
         self.mcache.put(&msg_id, raw_message);
 
-        // If the message is anonymous or has a random author add it to the published message ids
-        // cache.
-        if let PublishConfig::RandomAuthor | PublishConfig::Anonymous = self.publish_config {
-            if !self.config.allow_self_origin() {
-                self.published_message_ids.insert(msg_id.clone(), ());
-            }
-        }
+        debug!("Published message: {:?}", msg_id);
 
         // Send to peers we know are subscribed to the topic.
-        let msg_bytes = event.get_size();
         for peer_id in recipient_peers.iter() {
-            trace!("Sending message to peer: {:?}", peer_id);
-            self.send_message(*peer_id, event.clone())?;
-
-            if let Some(m) = self.metrics.as_mut() {
-                m.msg_sent(&topic_hash, msg_bytes);
-            }
-        }
-
-        debug!("Published message: {:?}", &msg_id);
-
-        if let Some(metrics) = self.metrics.as_mut() {
-            metrics.register_published_message(&topic_hash);
+            debug!("Sending message to peer: {:?}", peer_id);
+            self.notify_primary(*peer_id, event.clone());
         }
 
         Ok(msg_id)
@@ -1946,7 +1868,7 @@ where
         self.mcache.put(&msg_id, raw_message.clone());
 
         // Dispatch the message to the user if we are subscribed to any of the topics
-        if self.mesh.contains_key(&message.topic) {
+        if self.mesh.contains_key(&message.topic) || self.is_relay() {
             debug!("Sending received message to user");
             self.events
                 .push_back(ToSwarm::GenerateEvent(Event::Message {
@@ -1955,15 +1877,22 @@ where
                     message,
                 }));
         } else {
+            if !self.is_relay() {
+                debug!(
+                    "Received message on a topic we are not subscribed to: {:?}",
+                    message.topic
+                );
+                return;
+            }
+
             debug!(
-                "Received message on a topic we are not subscribed to: {:?}",
+                "Received message as relay node on topic: {:?}",
                 message.topic
             );
-            return;
         }
 
         // forward the message to mesh peers, if no validation is required
-        if !self.config.validate_messages() {
+        if !self.config.validate_messages() || self.is_relay() {
             if self
                 .forward_msg(
                     &msg_id,
@@ -2822,23 +2751,20 @@ where
         debug!("Forwarding message: {:?}", msg_id);
         let mut recipient_peers = HashSet::new();
 
-        {
-            // Populate the recipient peers mapping
-
-            // Add explicit peers
-            for peer_id in &self.explicit_peers {
-                if let Some(topics) = self.peer_topics.get(peer_id) {
+        if self.config.i_am_relay {
+            let topic = &message.topic;
+            // relay simply forwards the message to topic peers that included the relay to their relays mesh
+            if let Some(topic_peers) = self.topic_peers.get(topic) {
+                for peer_id in topic_peers {
                     if Some(peer_id) != propagation_source
-                        && !originating_peers.contains(peer_id)
                         && Some(peer_id) != message.source.as_ref()
-                        && topics.contains(&message.topic)
                         && self.included_to_relays_mesh.contains(peer_id)
                     {
                         recipient_peers.insert(*peer_id);
                     }
                 }
             }
-
+        } else {
             // add mesh peers
             let topic = &message.topic;
             // mesh
@@ -3569,19 +3495,29 @@ where
         if let Some(points) = self.peer_connections.get(&peer_id) {
             if !points.is_empty() {
                 let conn_id = points[0].0;
-
-                return self.events.push_back(ToSwarm::NotifyHandler {
-                    peer_id,
-                    event: HandlerIn::Message(event.into_protobuf()),
-                    handler: NotifyHandler::One(conn_id),
-                });
+                return self.notify_one(peer_id, conn_id, event);
             }
         }
 
         warn!("Expected at least one connection of the peer '{}'", peer_id);
 
-        self.send_message(peer_id, event.clone().into_protobuf())
-            .expect("Message fragmentation should not fail");
+        self.notify_any(peer_id, event.clone());
+    }
+
+    fn notify_any(&mut self, peer_id: PeerId, event: Rpc) {
+        self.events.push_back(ToSwarm::NotifyHandler {
+            peer_id,
+            handler: NotifyHandler::Any,
+            event: HandlerIn::Message(event.into_protobuf()),
+        });
+    }
+
+    fn notify_one(&mut self, peer_id: PeerId, conn_id: ConnectionId, event: Rpc) {
+        self.events.push_back(ToSwarm::NotifyHandler {
+            peer_id,
+            handler: NotifyHandler::One(conn_id),
+            event: HandlerIn::Message(event.into_protobuf()),
+        });
     }
 
     fn notify_excluded_from_relay_mesh(&mut self, peer: PeerId) {
