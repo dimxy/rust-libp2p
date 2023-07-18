@@ -30,7 +30,7 @@
 #[cfg(feature = "dcutr")]
 mod dcutr;
 #[cfg(feature = "gossipsub")]
-#[cfg(not(target_os = "unknown"))]
+#[cfg(any(not(target_os = "unknown"), target_arch = "wasm32"))]
 mod gossipsub;
 #[cfg(feature = "identify")]
 mod identify;
