@@ -105,6 +105,14 @@ rw-stream-sink = { version = "0.4.0", path = "misc/rw-stream-sink" }
 multiaddr = "0.18.0"
 multihash = "0.19.0"
 
+[workspace.lints]
+rust.unreachable_pub = "warn"
+clippy.used_underscore_binding = "warn"
+clippy.pedantic = { level = "allow", priority = -1 }
+clippy.type_complexity = "allow"
+clippy.unnecessary_wraps = "warn"
+clippy.manual_let_else = "warn"
+clippy.dbg_macro = "warn"
 
 [patch.crates-io]
 
