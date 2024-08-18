@@ -2767,14 +2767,22 @@ where
         } else {
             // add mesh peers
             let topic = &message.topic;
+            debug!("forward_msg adding mesh peer topic {:?} ", topic);
             // mesh
             if let Some(mesh_peers) = self.mesh.get(topic) {
+                debug!("forward_msg mesh_peers is some");
                 for peer_id in mesh_peers {
                     if Some(peer_id) != propagation_source
                         && !originating_peers.contains(peer_id)
                         && Some(peer_id) != message.source.as_ref()
                     {
                         recipient_peers.insert(*peer_id);
+                    } else {
+                        debug!("forward_msg no insert peer: Some(peer_id) != propagation_source {} !originating_peers.contains(peer_id) {} Some(peer_id) != message.source.as_ref() {}", 
+                            Some(peer_id) != propagation_source,
+                            !originating_peers.contains(peer_id),
+                            Some(peer_id) != message.source.as_ref()
+                        );
                     }
                 }
             }
@@ -2795,6 +2803,7 @@ where
             for peer in recipient_peers.iter() {
                 if let Some(received_from_peers) = self.duplicate_cache.get(&msg_id) {
                     if received_from_peers.contains(peer) {
+                        debug!("forward_msg received_from_peers {:?}, continue", peer);
                         continue;
                     }
                 }
@@ -2807,6 +2816,8 @@ where
             }
 
             r = true;
+        } else {
+            debug!("forward_msg Sending message: {:?} peers empty", msg_id);
         }
 
         if !self.relays_mesh.is_empty() {
