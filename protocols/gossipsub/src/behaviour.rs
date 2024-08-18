@@ -2748,7 +2748,7 @@ where
             }
         }
 
-        debug!("Forwarding message: {:?}", msg_id);
+        debug!("dimxy Forwarding message: {:?}", msg_id);
         let mut recipient_peers = HashSet::new();
 
         if self.config.i_am_relay {
