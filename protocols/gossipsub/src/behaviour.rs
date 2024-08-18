@@ -2752,6 +2752,7 @@ where
         let mut recipient_peers = HashSet::new();
 
         if self.config.i_am_relay {
+            debug!("forward_msg i_am_relay adding mesh peer topic {:?} ", topic);
             let topic = &message.topic;
             // relay simply forwards the message to topic peers that included the relay to their relays mesh
             if let Some(topic_peers) = self.topic_peers.get(topic) {
@@ -2763,6 +2764,8 @@ where
                         recipient_peers.insert(*peer_id);
                     }
                 }
+            } else {
+                debug!("forward_msg i_am_relay mesh_peers is none");
             }
         } else {
             // add mesh peers
@@ -2785,6 +2788,8 @@ where
                         );
                     }
                 }
+            } else {
+                debug!("forward_msg mesh_peers is none");
             }
         }
 
